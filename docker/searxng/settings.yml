@@ -1,0 +1,27 @@
+use_default_settings: true
+server:
+  secret_key: "prospectus-searxng-dev"
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "id"
+  formats:
+    - html
+    - json
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: google
+    disabled: false
+    proxies: warp
+  - name: bing
+    disabled: false
+    proxies: warp
+  - name: brave
+    disabled: false
+outgoing:
+  proxies:
+    warp:
+      - socks5h://warp:1080

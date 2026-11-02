@@ -1,0 +1,116 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17-trixie
+    container_name: prospectus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prospectus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prospectus_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-prospectus}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prospectus} -d ${POSTGRES_DB:-prospectus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - prospectus
+
+  warp:
+    image: caomingjun/warp:latest
+    container_name: prospectus-warp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"
+    environment:
+      WARP_SLEEP: "2"
+      GOST_ARGS: "-L :1080"
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+    networks:
+      - prospectus
+
+  searxng:
+    image: searxng/searxng:latest
+    depends_on:
+      - warp
+    container_name: prospectus-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
+    environment:
+      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8888}/
+    volumes:
+      - ./docker/searxng:/etc/searxng
+    networks:
+      - prospectus
+
+  scrapling:
+    image: pyd4vinci/scrapling:latest
+    depends_on:
+      - warp
+    container_name: prospectus-scrapling
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9701:8000"
+    command: ["mcp", "--http", "--host", "0.0.0.0", "--port", "8000", "--auth-token", "${SCRAPLING_MCP_AUTH_TOKEN}"]
+    environment:
+      SCRAPLING_MCP_AUTH_TOKEN: ${SCRAPLING_MCP_AUTH_TOKEN}
+    shm_size: "1gb"
+    mem_limit: 1500m
+    networks:
+      - prospectus
+
+  run-reaper:
+    image: postgres:17-trixie
+    container_name: prospectus-run-reaper
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGUSER: ${POSTGRES_USER:-prospectus}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-prospectus_dev}
+      PGDATABASE: ${POSTGRES_DB:-prospectus}
+      PGHOST: postgres
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          psql -q -c "update runs set status='failed', error='run marked failed: heartbeat stale beyond 10m (out-of-process reaper)', finished_at=now() where status='running' and heartbeat_at < now() - interval '10 minutes';" || true
+          psql -q -c "insert into run_events (run_id, campaign_id, stage, message) select id, campaign_id, 'done', 'run finished: failed (heartbeat stale beyond 15m, reaped)' from runs where status='failed' and error like 'run marked failed: heartbeat stale%' and finished_at > now() - interval '20 seconds';" || true
+          sleep 60
+        done
+    networks:
+      - prospectus
+
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:latest
+    container_name: prospectus-openobserve
+    profiles: ["dev"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5080:5080"
+    environment:
+      ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-root@example.com}
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-prospectus_dev}
+      ZO_DATA_DIR: /data
+      ZO_MEMORY_CACHE_MAX_SIZE: "512"
+    volumes:
+      - openobserve_data:/data
+    networks:
+      - prospectus
+
+volumes:
+  postgres_data:
+  openobserve_data:
+
+networks:
+  prospectus:
+    driver: bridge

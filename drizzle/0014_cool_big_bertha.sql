@@ -1,0 +1,1 @@
+ALTER TABLE "llm_providers" ADD COLUMN "extra_headers" jsonb DEFAULT '{}'::jsonb NOT NULL;

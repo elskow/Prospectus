@@ -1,0 +1,1 @@
+ALTER TABLE "campaigns" ADD COLUMN "sink_config" jsonb DEFAULT '{}'::jsonb NOT NULL;

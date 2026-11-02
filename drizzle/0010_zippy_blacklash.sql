@@ -1,0 +1,1 @@
+ALTER TABLE "campaigns" DROP COLUMN "max_cost_per_run_usd";

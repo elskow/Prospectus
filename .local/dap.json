@@ -1,0 +1,7 @@
+{
+  "bun": {
+    "type": "server",
+    "host": "127.0.0.1",
+    "command": ["/opt/homebrew/bin/node", "/tmp/js-debug/js-debug/src/dapDebugServer.js", "127.0.0.1:0"]
+  }
+}
