@@ -1,7 +1,9 @@
+import { Effect } from "effect";
 import { db } from "@src/db";
 import { campaigns, companies, contacts, leads, runs } from "@src/db/schema";
 import { finishRun, requeueExpiredLeases } from "@src/harness/persistence";
 import { enqueueRun } from "@src/harness/run-queue";
+import { pruneCache } from "@src/harness/websearch/cache";
 import { and, desc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 
 const TICK_INTERVAL_MS = 5 * 60_000;
@@ -10,6 +12,8 @@ const SCHEDULE_COOLDOWN_FALLBACK_MS = 24 * 60 * 60_000;
 const STALE_RUN_THRESHOLD_MS = 10 * 60_000;
 let lastDedupeSweepAt = 0;
 const DEDUPE_SWEEP_COOLDOWN_MS = 24 * 60 * 60_000;
+let lastCachePruneAt = 0;
+const CACHE_PRUNE_COOLDOWN_MS = 60 * 60_000;
 
 async function sweepStaleRuns(): Promise<number> {
   const stale = await db
@@ -28,6 +32,7 @@ const DEDUPE_SIMILARITY_THRESHOLD = 0.6;
 const DEDUPE_SWEEP_LIMIT = 40;
 
 async function sweepFuzzyDuplicates(): Promise<number> {
+  await db.execute(sql`select set_limit(${DEDUPE_SIMILARITY_THRESHOLD})`);
   const candidates = await db.execute(sql`
     select
       a.id as keep_id, b.id as drop_id,
@@ -36,8 +41,9 @@ async function sweepFuzzyDuplicates(): Promise<number> {
     from companies a
     join companies b
       on a.id < b.id
-      and similarity(a.name, b.name) >= ${DEDUPE_SIMILARITY_THRESHOLD}
+      and a.name % b.name
       and lower(coalesce(a.city, '')) = lower(coalesce(b.city, ''))
+      and left(lower(a.name), 1) = left(lower(b.name), 1)
       and (
         (a.website is not null and b.website is not null
           and regexp_replace(lower(a.website), '^https?://(www\.)?', '') = regexp_replace(lower(b.website), '^https?://(www\.)?', ''))
@@ -103,6 +109,10 @@ export async function schedulerTick(): Promise<SchedulerTickResult> {
 async function runSchedulerTick(): Promise<SchedulerTickResult> {
   await requeueExpiredLeases().catch(() => 0);
   await sweepStaleRuns();
+  if (Date.now() - lastCachePruneAt >= CACHE_PRUNE_COOLDOWN_MS) {
+    lastCachePruneAt = Date.now();
+    Effect.runFork(Effect.ignore(pruneCache()));
+  }
   if (Date.now() - lastDedupeSweepAt >= DEDUPE_SWEEP_COOLDOWN_MS) {
     lastDedupeSweepAt = Date.now();
     try {

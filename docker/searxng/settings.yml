@@ -13,15 +13,19 @@ search:
 engines:
   - name: duckduckgo
     disabled: false
+    network: warp
   - name: google
     disabled: false
-    proxies: warp
+    network: warp
   - name: bing
     disabled: false
-    proxies: warp
+    network: warp
   - name: brave
     disabled: false
 outgoing:
-  proxies:
+  proxies: null
+  networks:
     warp:
-      - socks5h://warp:1080
+      proxies:
+        all://:
+          - socks5h://warp:1080

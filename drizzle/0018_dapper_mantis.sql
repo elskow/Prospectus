@@ -1,0 +1,1 @@
+ALTER TABLE "hunt_jobs" ADD COLUMN "outcomes" jsonb DEFAULT '[]'::jsonb NOT NULL;

@@ -24,20 +24,11 @@ export const useAuth = () => {
     return res.user;
   };
 
-  const register = async (email: string, name: string, password: string) => {
-    const res = await $fetch<{ user: SessionUser }>("/api/auth/register", {
-      method: "POST",
-      body: { email, name, password },
-    });
-    user.value = res.user;
-    return res.user;
-  };
-
   const logout = async () => {
     await $fetch("/api/auth/logout", { method: "POST" });
     user.value = null;
     await navigateTo("/login");
   };
 
-  return { user, fetchMe, login, register, logout };
+  return { user, fetchMe, login, logout };
 };

@@ -39,7 +39,13 @@ export const readCache = (hash: string): Effect.Effect<WebResult[] | null> =>
 export const writeCache = (hash: string, query: string, backend: string, results: WebResult[]): Effect.Effect<void> =>
   Effect.promise(async () => {
     try {
-      await db.insert(webSearchCache).values({ queryHash: hash, query, results, backend });
+      await db
+        .insert(webSearchCache)
+        .values({ queryHash: hash, query, results, backend })
+        .onConflictDoUpdate({
+          target: webSearchCache.queryHash,
+          set: { results, backend, createdAt: new Date() },
+        });
     } catch {}
   });
 

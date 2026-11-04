@@ -1,7 +1,4 @@
-import { eq } from "drizzle-orm";
-import { db } from "@src/db";
-import { leads } from "@src/db/schema";
-import { findReadyLeadIds, findReadyLeads, markLeadsSynced } from "@src/harness/persistence";
+import { findReadyLeadsWithIds, markLeadsSynced } from "@src/harness/persistence";
 import { resolveSinkForCampaign, type ResolvedSink } from "@src/harness/sink-resolver";
 import type { GoalLoopOptions, ProgressEvent } from "@src/harness/goal-loop/types";
 
@@ -13,12 +10,12 @@ export async function syncReadyLeads(
     readonly emit: (event: ProgressEvent) => void;
   },
 ): Promise<number> {
-  const pendingLeads = await findReadyLeads(options.campaignId);
+  const pendingLeads = await findReadyLeadsWithIds(options.campaignId);
   if (pendingLeads.length === 0) return 0;
 
   const resolved: ResolvedSink = await resolveSinkForCampaign(options.campaignId);
   const sinkResult = await resolved.adapter.write(
-    pendingLeads as never,
+    pendingLeads.map((entry) => entry.lead) as never,
     {
       userId: options.userId,
       runId,
@@ -26,8 +23,7 @@ export async function syncReadyLeads(
     } as never,
   );
 
-  const readyIds = await db.select({ id: leads.id }).from(leads).where(eq(leads.campaignId, options.campaignId));
-  await markLeadsSynced(await findReadyLeadIds(options.campaignId));
+  await markLeadsSynced([...new Set(pendingLeads.map((entry) => entry.leadId))]);
 
   deps.emit({ stage: "sync", message: `${pendingLeads.length} contact rows → ${sinkResult.targetLocation}` });
   return pendingLeads.length;

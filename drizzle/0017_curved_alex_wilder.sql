@@ -1,0 +1,1 @@
+ALTER TABLE "ingest_jobs" ALTER COLUMN "campaign_id" DROP NOT NULL;

@@ -20,6 +20,8 @@ export const leadCandidateSchema = z.object({
   phone: z.string().nullish().describe("Business phone appearing verbatim in the source; null when absent."),
   website: z.string().url().nullish().describe("The business's own website URL; null when absent or when only a social media page exists."),
   city: z.string().nullish().describe("City the business operates in, as observable in the source; null when unclear."),
+  province: z.string().nullish().describe("Province, state, or department the business operates in, as shown in the source; null when absent."),
+  country: z.string().nullish().describe("Country the business operates in, as shown in the source; null when absent. Never infer it."),
   category: z.string().nullish().describe("Business category or industry as shown in the source; null when unclear."),
   rating: z.number().min(0).max(5).nullish().describe("Rating value shown in the source; null when no rating is displayed."),
   reviewCount: z.number().int().nonnegative().nullish().describe("Number of reviews shown in the source; null when not displayed."),
@@ -29,6 +31,7 @@ export const leadCandidateSchema = z.object({
     .nullish()
     .describe("Named people with contact details found on the page; null when no people are mentioned. Every field must be observed verbatim or null."),
   sourceUrl: z.string().nullish(),
+  raw: z.record(z.string(), z.unknown()).nullish(),
 });
 
 export type LeadCandidate = z.infer<typeof leadCandidateSchema>;

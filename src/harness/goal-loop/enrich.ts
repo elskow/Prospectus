@@ -33,7 +33,7 @@ export interface EnrichDeps {
   readonly runId: string;
   readonly tracer: HarnessTracer;
   readonly sources: ResolvedSource[];
-  readonly trackUsage: (stage: "planner" | "extractor" | "chat", usage: { inputTokens: number; outputTokens: number } | null) => void;
+  readonly trackUsage: (stage: "planner" | "extractor", usage: { inputTokens: number; outputTokens: number } | null) => void;
   readonly errors: RunFailure[];
   readonly state: RunState;
   readonly siteContentCache: Map<string, string | null>;

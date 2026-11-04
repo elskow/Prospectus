@@ -49,6 +49,46 @@ A campaign owns a queue of markets seeded from `area` × `niche`. Each run activ
 
 `workers/google-maps.cjs` runs as a daemon (`MAPS_DAEMON_PORT`, default 9710) started by `server/plugins/maps-daemon.ts`. Each client — the server or any run worker — connects over TCP and sends NDJSON frames. The daemon keeps **one browser per proxy key** (`proxyUrl` in the payload), serializes requests per key, and evicts idle sessions after `MAPS_DAEMON_IDLE_MS`. Clients fall back to spawning a private worker when no daemon answers.
 
+The Cloudflare-fronted directory adapters (`indotrading`, `indonetwork`) fetch via a plain bun-subprocess transport first (cheap path); when the response looks like a Cloudflare challenge (403 or challenge markers — titles are locale-dependent, e.g. "Tunggu sebentar…"), `src/harness/ingest/cf-fetch.ts` retries the same URL through `workers/stealth-fetch.cjs` (Patchright headless Chromium, `patchrightStealthFetch`), which renders the interstitial natively — no clearance cookie or cache involved.
+
+## Master data
+
+Companies and contacts are a global, deduplicated asset independent of campaigns; a campaign lead references a master company. The deliverable is a company row with an email.
+
+| Piece | Responsibility |
+|---|---|
+| `src/harness/ingest/registry.ts` | `DirectoryAdapter` contract (`firstPage`/`nextPage` returning rows + cursor); adapters self-register |
+| `src/harness/ingest/kemenperin.ts` | reference adapter scraping the Kemenperin company directory |
+| `src/harness/ingest/kemendagexim.ts` | `kemendag-exim` adapter scraping the Kemendag export-import directory |
+| `src/harness/ingest/run.ts` | generic runner: pages → `LeadCandidate`s → `persistCandidates`; counts pages/rows/withEmail/newCompanies/duplicates/rejected/flagged |
+| `POST /api/ingest/run` | starts a directory ingest (`{ adapterId, pages }`), returns counters |
+| `GET /api/master/*` | master read API: stats (cached 60 s), company list (keyset pagination via `nextCursor`, `reachable=email` filters on the `has_email` partial index), single company, CSV export (`/api/master/companies.csv`) |
+| `POST /api/hunt/jobs` | on-demand email hunt; row in `hunt_jobs` (`queued → running → succeeded/failed/cancelled`) tracks `requestedCount`/`processedCount`/`emailsFound`; targets need a website and `email_hunt_attempts < 2` (max two attempts per company) |
+| `POST /api/campaigns/import` | inserts existing master companies as campaign leads (`created_by_run_id` null, status `new`, then `promoteReadyLeads`); already-present companies count as `duplicates`, not errors; `hunt:true` starts a scoped hunt job for the imported companies |
+
+Validation gate (`src/harness/validation.ts`): every candidate gets a verdict —
+`reject` (blank or generic name) never touches the database, `review` (malformed
+email, unusable phone, non-http website) stores the company with
+`status='needs_review'` plus machine-readable `validation_notes`, `accept` stores
+`status='valid'`. `has_email` is a maintained flag recomputed from contacts on
+every contact write (`refreshCompanyEmailFlag`).
+
+```
+directory adapter (kemenperin · kemendag-exim)
+  └─ POST /api/ingest/run { adapterId, pages }
+       └─ run.ts: pages → LeadCandidates
+            ├─ validation.ts gate: accept → status='valid'
+            │                      review → status='needs_review' + validation_notes
+            │                      reject → dropped
+            └─ persistCandidates: dedupe on companies.dedupe_key,
+               contacts conflict-upsert, refreshCompanyEmailFlag
+                 ├─ GET /api/master/* (list · stats · CSV)
+                 ├─ POST /api/hunt/jobs → hunt_jobs → crawl/role/pattern backfill
+                 │     (targets: website present, email_hunt_attempts < 2)
+                 └─ POST /api/campaigns/import → leads(status='new',
+                       created_by_run_id=null) → promoteReadyLeads
+```
+
 ## Email readiness
 
 A lead is `ready` only when its company has a contact email. Three sources feed that:

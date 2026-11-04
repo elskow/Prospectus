@@ -1,6 +1,6 @@
-import { promises as dns } from "node:dns";
 import { extractPhones, pageTextOf } from "@src/harness/contact-discovery";
 import { extractContactsWithAi } from "@src/harness/contact-ai";
+import { hasMailExchange } from "@src/harness/dns-cache";
 import { fetchWebResults, type WebResult } from "@src/harness/websearch";
 
 export interface OsintContactHarvest {
@@ -127,12 +127,8 @@ export async function domainHasMailInfrastructure(domainRaw: string): Promise<bo
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
     .replace(/\/.*$/, "");
-  try {
-    const mx = await dns.resolveMx(domain);
-    return mx.length > 0;
-  } catch {
-    return false;
-  }
+  if (!domain) return false;
+  return hasMailExchange(domain);
 }
 
 export async function whatsappReachable(phoneRaw: string): Promise<boolean> {

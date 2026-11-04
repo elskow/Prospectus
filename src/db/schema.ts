@@ -85,7 +85,7 @@ export const runs = pgTable(
       .notNull()
       .references(() => campaigns.id, { onDelete: "cascade" }),
     status: text("status", { enum: ["queued", "running", "succeeded", "failed", "cancelled", "paused"] }).notNull(),
-    trigger: text("trigger", { enum: ["schedule", "chat", "manual"] }).notNull(),
+    trigger: text("trigger", { enum: ["schedule", "manual"] }).notNull(),
     traceId: text("trace_id"),
     turns: integer("turns").notNull().default(0),
     costUsd: doublePrecision("cost_usd").notNull().default(0),
@@ -218,6 +218,15 @@ export const companies = pgTable(
     emailHuntAttempts: integer("email_hunt_attempts").notNull().default(0),
     fieldProvenance: jsonb("field_provenance").$type<Record<string, unknown>>().notNull(),
 
+    status: text("status", { enum: ["valid", "needs_review", "rejected"] })
+      .notNull()
+      .default("valid"),
+    hasEmail: boolean("has_email").notNull().default(false),
+    validationNotes: jsonb("validation_notes")
+      .$type<Array<{ rule: string; message: string; at: string }>>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+
     createdByRunId: uuid("created_by_run_id").references(() => runs.id, { onDelete: "set null" }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -226,16 +235,47 @@ export const companies = pgTable(
     uniqueIndex("companies_dedupe_key_idx").on(t.dedupeKey),
     index("companies_city_idx").on(t.city),
     index("companies_name_trgm_idx").using("gin", sql`name gin_trgm_ops`),
+    index("companies_status_created_idx").on(t.status, t.createdAt),
+    index("companies_email_created_idx")
+      .on(t.createdAt)
+      .where(sql`has_email`),
   ],
 );
+
+export const huntJobs = pgTable(
+  "hunt_jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    status: text("status", { enum: ["queued", "running", "succeeded", "failed", "cancelled"] })
+      .notNull()
+      .default("queued"),
+    filter: jsonb("filter"),
+    requestedCount: integer("requested_count").notNull().default(0),
+    processedCount: integer("processed_count").notNull().default(0),
+    emailsFound: integer("emails_found").notNull().default(0),
+    outcomes: jsonb("outcomes").$type<HuntTargetOutcome[]>().notNull().default([]),
+    error: text("error"),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [index("hunt_jobs_status_idx").on(t.status, t.createdAt)],
+);
+
+export type HuntJob = typeof huntJobs.$inferSelect;
+
+export interface HuntTargetOutcome {
+  companyId: string;
+  emailsFound: number;
+  outcome: "found" | "no_website" | "site_unreachable" | "no_mx" | "domain_mismatch" | "no_contacts" | "exhausted_attempts";
+}
 
 export const ingestJobs = pgTable(
   "ingest_jobs",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    campaignId: uuid("campaign_id")
-      .notNull()
-      .references(() => campaigns.id, { onDelete: "cascade" }),
+    campaignId: uuid("campaign_id").references(() => campaigns.id, { onDelete: "cascade" }),
     source: text("source").notNull(),
     status: text("status", { enum: ["queued", "running", "succeeded", "failed"] })
       .notNull()
@@ -246,6 +286,8 @@ export const ingestJobs = pgTable(
     rowsWithEmail: integer("rows_with_email").notNull().default(0),
     newCompanies: integer("new_companies").notNull().default(0),
     newLeads: integer("new_leads").notNull().default(0),
+    rejected: integer("rejected").notNull().default(0),
+    flagged: integer("flagged").notNull().default(0),
     error: text("error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

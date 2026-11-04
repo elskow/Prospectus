@@ -628,7 +628,10 @@ async function runTurns(ctx: RunContext, spec: CampaignSpec, startCount: number)
           const sourceId = sourceIdByLabel.get(label) ?? batch[0]?.sourceId;
           if (!sourceId) continue;
           const persist = await persistCandidates({ campaignId: options.campaignId, runId, sourceId, candidates });
-          emit({ stage: "persist", message: `+${persist.newLeads} new companies, ${persist.duplicates} duplicates (${label})` });
+          emit({
+            stage: "persist",
+            message: `+${persist.newLeads} new companies, ${persist.duplicates} duplicates, ${persist.rejected ?? 0} rejected, ${persist.flagged ?? 0} flagged (${label})`,
+          });
           newLeadsFromQuery += persist.newLeads;
           turnDiscovered += persist.newLeads;
           for (const candidate of candidates) indexCandidate(state.knownArtifacts, candidate);

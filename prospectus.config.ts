@@ -12,4 +12,10 @@ export const prospectusConfig: ProspectusConfig = {
     { type: "sink:google-sheets", enabled: true },
     { type: "sink:csv", enabled: true },
   ],
+  directories: {
+    adapters: [
+      { id: "kemenperin", enabled: true },
+      { id: "kemendag-exim", enabled: true },
+    ],
+  },
 };

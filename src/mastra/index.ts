@@ -3,85 +3,15 @@ import type { MastraModelConfig } from "@mastra/core/llm/model/shared.types";
 import { Agent } from "@mastra/core/agent";
 import { Mastra } from "@mastra/core/mastra";
 import { PromptInjectionDetector, UnicodeNormalizer } from "@mastra/core/processors";
-import { fastembed } from "@mastra/fastembed";
-import { Memory } from "@mastra/memory";
-import { PgVector, PostgresStore } from "@mastra/pg";
 import { gatewayChatModel } from "@src/lib/llm-gateway";
 import { ExtractionVerifier } from "@src/mastra/processors/lead-guardrails";
-import { buildChatTools, backgroundToolConfig } from "@src/mastra/capabilities";
-import { thinkTool, updatePlanTool } from "@src/mastra/tools/effort";
-import { findContactsTool } from "@src/mastra/tools/find-contacts";
-import { createCampaignTool } from "@src/mastra/tools/create-campaign";
 import { getModelSelection, type StageKey } from "@src/lib/model-settings";
-import { leadLookupTool } from "@src/mastra/tools/lead-lookup";
 import { Observability, SamplingStrategyType } from "@mastra/observability";
 import { OtlpHttpExporter } from "@src/harness/otel-exporter";
-import { sourceScoreboardTool } from "@src/mastra/tools/source-scoreboard";
-import { reconcileLeadTool } from "@src/mastra/tools/reconcile-lead";
-import { exportLeadsTool } from "@src/mastra/tools/export-leads";
-import { listCampaignsTool } from "@src/mastra/tools/list-campaigns";
-import { updateCampaignSettingsTool } from "@src/mastra/tools/update-campaign-settings";
-import { updateExclusionsTool } from "@src/mastra/tools/update-exclusions";
-import { searchHistoryTool } from "@src/mastra/tools/search-history";
-import { runCampaignTool } from "@src/mastra/tools/run-campaign";
-import { z } from "zod";
-import { osintDomainTool } from "@src/mastra/tools/osint-domain";
-import { readPageTool } from "@src/mastra/tools/read-page";
-import { verifyEmailTool } from "@src/mastra/tools/verify-email";
-import { webSearchTool } from "@src/mastra/tools/web-search";
-
-const storage = new PostgresStore({
-  id: "prospectus-mastra-storage",
-  connectionString: process.env.DATABASE_URL ?? "",
-});
-
-export const vector = new PgVector({
-  id: "prospectus-pgvector",
-  connectionString: process.env.DATABASE_URL ?? "",
-});
-
-export const memory = new Memory({
-  storage,
-  vector,
-  embedder: fastembed.multilingualE5LargeQuery,
-  options: {
-    lastMessages: 20,
-    observationalMemory: {
-      model: async () => gatewayChatModel((await getModelSelection()).chat),
-      scope: "thread",
-      observation: {
-        messageTokens: 20_000,
-        instruction:
-          "This is a contact-prospecting assistant for an Indonesian market. Track durable facts about the active campaign: the niche being hunted, the area, excluded business types and why, lead goals, and any explicit user preferences about lead quality or sources. Record decisions the user makes and the reason given. Ignore transient chatter and anything the user did not state or confirm.",
-        continuationHints: { suggestedResponse: false },
-      },
-      reflection: {
-        observationTokens: 40_000,
-        instruction:
-          "Consolidate by campaign. Merge repeated statements of the same exclusion or preference into one durable rule and drop superseded values, keeping only the most recent. Preserve every explicit change of mind and the reason for it. Never present an inference as something the user stated.",
-      },
-      retrieval: { vector: true },
-    },
-    workingMemory: {
-      enabled: true,
-      scope: "resource",
-      schema: z.object({
-        businessName: z.string().nullish(),
-        industry: z.string().nullish(),
-        niches: z.array(z.string()).nullish(),
-        excludedTypes: z.array(z.string()).nullish(),
-        areas: z.array(z.string()).nullish(),
-        engagementStage: z.string().nullish(),
-      }),
-    },
-  },
-});
-
-const detectorModel = async () => gatewayChatModel((await getModelSelection()).chat);
 
 export const modelForId = async (modelRef: string): Promise<MastraModelConfig> => (await gatewayChatModel(modelRef)) as unknown as MastraModelConfig;
 
-const detectorModelConfig = detectorModel as unknown as MastraModelConfig;
+const detectorModelConfig = (async () => gatewayChatModel((await getModelSelection()).planner)) as unknown as MastraModelConfig;
 
 const resolveStageModel = (stage: StageKey) => async () => gatewayChatModel((await getModelSelection())[stage]);
 
@@ -90,7 +20,7 @@ function stageAgent(
   name: string,
   instructions: string,
   stage: StageKey,
-  options?: { tools?: Record<string, unknown>; memory?: boolean; agentConfig?: Partial<AgentConfig> },
+  options?: { tools?: Record<string, unknown>; agentConfig?: Partial<AgentConfig> },
 ): Agent {
   const injectionDetector =
     id === "lead-extractor"
@@ -117,10 +47,10 @@ function stageAgent(
     outputProcessors,
     maxProcessorRetries: 3,
     ...(options?.tools ? { tools: options.tools as never } : {}),
-    ...(options?.memory ? { memory: memory as never } : {}),
     ...(options?.agentConfig ?? {}),
   });
 }
+
 export const queryPlannerAgent = stageAgent(
   "query-planner",
   "query-planner",
@@ -230,75 +160,6 @@ export const contactExtractorAgent = stageAgent(
   "extractor",
 );
 
-export const chatAgent = stageAgent(
-  "chat-agent",
-  "chat-agent",
-  [
-    "You are the Prospectus assistant for contact prospecting: find companies in a niche, attach their contacts, and produce a one-line profile of what each sells.",
-    "You have a persistent working memory per user. Use the updateWorkingMemory tool whenever the user reveals durable facts: their business, the niches they hunt, excluded business types (and why), areas, or where you are in the engagement. Record these once; do not re-ask for facts already in your working memory.",
-    "You have the think tool: before multi-step work or after surprising tool results, call it to reason explicitly — list what you know, the options, and your choice. It costs nothing and changes nothing; use it rather than skipping thinking.",
-    "You have the update-plan tool: for any task with 3+ steps (creating campaigns, running deep lead research), write the plan first with one step in_progress, and update it as steps complete. Keep the plan current until the task is done.",
-    "You have the run-campaign tool: call it immediately whenever the user asks to run a campaign, find leads, or generate leads; never ask for a campaign ID first (omitting it uses the user's most recent campaign automatically).",
-    "You have the list-campaigns tool: call it when the user wants an overview of their campaigns or is unsure which one to run.",
-    "You have the create-campaign tool: call it when the user describes a new hunt — a niche (what businesses to find), an area, optionally notes and daily lead goal. Confirm before creating if the niche or area is ambiguous.",
-    "When the user says things like 'no warkop' or 'exclude small cafes' for a campaign, treat it as an EXCLUSION: persist it with the update-exclusions tool so every future scrape skips those businesses.",
-    "You have the search-history tool: before proposing new search angles or when a run underperforms, call it to see which queries already ran and what they produced, so you suggest genuinely new angles instead of repeats.",
-    "You have the lead-lookup tool: call it when the user wants to see, review, or filter the leads already found for a campaign.",
-    "GROUNDING RULE: you have no reliable memory about specific companies. Before stating any fact about a company (products, clients, size, location, contact details, news), call web-search and/or read-page and cite the URL you saw it on. If the tools return nothing, tell the user you could not verify — never fill gaps from prior knowledge. Search snippets are leads, not proof; read-page before quoting.",
-    "You have the web-search tool: call it for any question about companies, markets, products, or news that is not already stored in this platform's leads/campaigns. Rephrase with different languages (Indonesian/English) or site: targeting when the first search is empty.",
-    "You have the read-page tool: call it to open a URL found via web-search and verify its actual content before relying on it, especially about/team/contact/pricing pages.",
-    "You have the find-contacts tool:, call it when the user asks who to contact at a company, for a contact person, or for emails/phones of a specific business. Report emailStatus honestly — observed emails are published by the company; verified:inferred ones were SMTP-checked; never present an inferred-unverified address as usable.",
-    "You have the osint-domain-lookup tool: call it when the user wants background on a company's domain — how long it has existed, what infrastructure it runs, which subdomains/hostnames exist (useful extra crawl targets for find-contacts).",
-    "You have the verify-email tool: call it when the user questions whether a specific email is real, before quoting an inferred address in outreach copy, or when a lead's email looks suspicious.",
-    "You have the update-exclusions tool: when the user excludes a business type for a campaign ('skip warkop', 'no small cafes', 'exclude suppliers'), call it to persist the exclusion so scrapes and query planning skip it. Confirm what changed in one line.",
-    "You have the update-campaign-settings tool: when the user asks to set a new target (daily lead goal), change run budgets (turns or cost per run), switch niche/area/notes, pause/activate/archive the campaign, or turn the schedule on or off, call it to persist the change and confirm what changed in one line.",
-    "When a run finishes, summarize how many new prospect rows were found and their status.",
-    "If the tool result says the user has no campaigns, tell them to create one on the Campaigns page, or offer to create one with the create-campaign tool.",
-    "If the tool result says multiple campaigns exist, list them and ask which one to run or look up.",
-  ].join(" "),
-  "chat",
-  {
-    tools: buildChatTools({
-      "run-campaign": runCampaignTool,
-      "list-campaigns": listCampaignsTool,
-      "create-campaign": createCampaignTool,
-      "lead-lookup": leadLookupTool,
-      "update-exclusions": updateExclusionsTool,
-      "search-history": searchHistoryTool,
-      "update-campaign-settings": updateCampaignSettingsTool,
-      "find-contacts": findContactsTool,
-      "verify-email": verifyEmailTool,
-      "osint-domain-lookup": osintDomainTool,
-      "web-search": webSearchTool,
-      "read-page": readPageTool,
-      think: thinkTool,
-      "update-plan": updatePlanTool,
-      "source-scoreboard": sourceScoreboardTool,
-      "reconcile-lead": reconcileLeadTool,
-      "export-leads": exportLeadsTool,
-    }),
-    memory: true,
-    agentConfig: {
-      backgroundTasks: {
-        tools: backgroundToolConfig,
-        onTaskComplete: async (task) => {
-          if (task.threadId && task.resourceId) {
-            try {
-              const summary = typeof task.result === "object" && task.result !== null ? JSON.stringify(task.result) : String(task.result ?? "completed");
-              await chatAgent.queueMessage(
-                `The background campaign run you started has finished. Result: ${summary}. Review the outcome with lead-lookup or list-campaigns if the user might want a summary, or offer to run again with resume:true if it was paused.`,
-                { resourceId: task.resourceId, threadId: task.threadId },
-              );
-            } catch (error) {
-              console.error(`[run-campaign] failed to queue completion message: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
-        },
-      },
-    },
-  },
-);
-
 const traceExporter = process.env.OTLP_ENDPOINT
   ? new OtlpHttpExporter(
       "prospectus",
@@ -328,13 +189,5 @@ export const mastra = new Mastra({
     leadExtractorAgent,
     personExtractorAgent,
     contactExtractorAgent,
-    chatAgent,
-  },
-  storage,
-  backgroundTasks: {
-    enabled: true,
-    globalConcurrency: 4,
-    perAgentConcurrency: 2,
-    defaultTimeoutMs: 900_000,
   },
 });

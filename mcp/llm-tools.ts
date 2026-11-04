@@ -158,18 +158,16 @@ export async function runLlmTools(): Promise<ToolDefinition[]> {
     {
       name: "llm_set_stages",
       description:
-        "Set the model used by the planner, extractor, or chat stage. Each stage takes a providerId and model. The model is probed before applying and registered if the provider lacks /models. Additional runs pick up the change on their next call.",
+        "Set the model used by the planner or extractor stage. Each stage takes a providerId and model. The model is probed before applying and registered if the provider lacks /models. Additional runs pick up the change on their next call.",
       schema: z.object({
         planner: stageTargetSchema.optional(),
         extractor: stageTargetSchema.optional(),
-        chat: stageTargetSchema.optional(),
       }),
       handler: async (input) => {
         const parsed = z
           .object({
             planner: stageTargetSchema.optional(),
             extractor: stageTargetSchema.optional(),
-            chat: stageTargetSchema.optional(),
           })
           .parse(input);
 

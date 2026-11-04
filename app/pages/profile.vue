@@ -10,6 +10,9 @@ const { user, fetchMe } = useAuth();
 const loading = ref(true);
 const name = ref("");
 const savingProfile = ref(false);
+const email = ref("");
+const savingEmail = ref(false);
+const emailError = ref<string | null>(null);
 const currentPassword = ref("");
 const newPassword = ref("");
 const confirmPassword = ref("");
@@ -19,8 +22,29 @@ const passwordError = ref<string | null>(null);
 onMounted(async () => {
   if (!user.value) await fetchMe();
   name.value = user.value?.name ?? "";
+  email.value = user.value?.email ?? "";
   loading.value = false;
 });
+
+async function changeEmail() {
+  emailError.value = null;
+  if (!email.value.trim() || email.value.trim() === user.value?.email) return;
+  savingEmail.value = true;
+  try {
+    const res = await $fetch<{ user: { id: string; email: string; name: string } }>("/api/auth/profile", {
+      method: "PATCH",
+      body: { email: email.value.trim() },
+    });
+    if (user.value) user.value.email = res.user.email;
+    toast.success("Email updated.");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    if (message.includes("already registered")) emailError.value = "That email is already registered";
+    else emailError.value = friendlyError(err);
+  } finally {
+    savingEmail.value = false;
+  }
+}
 
 async function saveProfile() {
   if (!name.value.trim()) return;
@@ -97,6 +121,27 @@ async function savePassword() {
             </Button>
           </div>
         </div>
+      </section>
+
+      <section aria-labelledby="profile-email-heading">
+        <h2 id="profile-email-heading" class="text-sm font-semibold uppercase tracking-widest text-muted-foreground">Email</h2>
+        <form class="mt-4 space-y-4 rounded-xl border border-border bg-card px-5 py-5" @submit.prevent="changeEmail">
+          <div class="space-y-1.5">
+            <Label for="profile-current-email">Current email</Label>
+            <Input id="profile-current-email" :model-value="user?.email ?? ''" disabled />
+            <p class="text-xs text-muted-foreground">Your email is your sign-in identity.</p>
+          </div>
+          <div class="space-y-1.5">
+            <Label for="profile-new-email">Change email</Label>
+            <Input id="profile-new-email" v-model="email" type="email" required placeholder="you@example.com" />
+          </div>
+          <p v-if="emailError" class="text-xs text-destructive">{{ emailError }}</p>
+          <div class="flex justify-end">
+            <Button type="submit" size="sm" :disabled="savingEmail || !email.trim() || email.trim() === user?.email">
+              {{ savingEmail ? "Saving…" : "Change email" }}
+            </Button>
+          </div>
+        </form>
       </section>
 
       <section aria-labelledby="profile-password-heading">

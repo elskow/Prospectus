@@ -5,14 +5,13 @@ import { appSettings, models } from "@src/db/schema";
 import { defaultProvider, findProvider } from "@src/lib/llm-providers";
 import { parseModelRef } from "@src/lib/model-ref";
 
-export const STAGE_KEYS = ["planner", "extractor", "chat"] as const;
+export const STAGE_KEYS = ["planner", "extractor"] as const;
 
 export type StageKey = (typeof STAGE_KEYS)[number];
 
 export const modelSelectionSchema = z.object({
   planner: z.string().min(1),
   extractor: z.string().min(1),
-  chat: z.string().min(1),
 });
 
 export type ModelSelection = z.infer<typeof modelSelectionSchema>;
@@ -22,7 +21,6 @@ export const MODEL_SETTINGS_KEY = "model-selection";
 export const DEFAULT_MODEL_SELECTION: ModelSelection = {
   planner: "ht/bandelbanget/deepseek-v4.1-flash",
   extractor: "ht/bandelbanget/deepseek-v4.1-flash",
-  chat: "ht/bandelbanget/deepseek-v4.1-flash",
 };
 
 let selectionCache: { value: ModelSelection; expiresAt: number } | null = null;

@@ -1,11 +1,12 @@
 import { eq, and, isNull, isNotNull } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import { db } from "@src/db";
-import { contacts, suppressions } from "@src/db/schema";
+import { contacts, suppressions, type HuntTargetOutcome } from "@src/db/schema";
 import { guessPersonalEmails, inferEmailPattern, websiteMatchesCompany } from "@src/harness/contact-discovery";
 import { domainHasMailInfrastructure, harvestPersonEmailEvidence } from "@src/harness/osint-contacts";
 import { learnRolePrefixes } from "@src/harness/email-vocabulary";
 import { verifyEmailRemote } from "@src/harness/email-verifier";
+import { refreshCompanyEmailFlag } from "@src/harness/persistence";
 import type { HarnessTracer } from "@src/harness/tracer";
 
 export interface EmailBackfillTarget {
@@ -24,20 +25,29 @@ interface ProgressSink {
   (stage: "persist", message: string): void;
 }
 
-export async function backfillNamedContactEmails(target: EmailBackfillTarget, tracer: HarnessTracer, onProgress: ProgressSink): Promise<number> {
+export async function backfillNamedContactEmails(
+  target: EmailBackfillTarget,
+  tracer: HarnessTracer,
+  onProgress: ProgressSink,
+): Promise<{ emailsFound: number; outcome: HuntTargetOutcome["outcome"] }> {
+  const domain = websiteDomainOf(target.website);
+  if (!domain) return { emailsFound: 0, outcome: "no_website" };
+  if (!websiteMatchesCompany(`https://${domain}`, target.companyName)) return { emailsFound: 0, outcome: "domain_mismatch" };
+  if (!(await domainHasMailInfrastructure(domain).catch(() => false))) return { emailsFound: 0, outcome: "no_mx" };
   const namedContactRows = await db
     .select({ id: contacts.id, name: contacts.name, email: contacts.email })
     .from(contacts)
     .where(and(eq(contacts.companyId, target.companyId), isNotNull(contacts.name), isNull(contacts.email)));
 
-  let filled = 0;
+  let emailsFound = 0;
   if (namedContactRows.length > 0) {
-    filled += await backfillFromWebEvidence(target, tracer, onProgress, namedContactRows);
-    filled += await backfillFromPattern(target, onProgress, namedContactRows);
+    emailsFound += await backfillFromWebEvidence(target, tracer, onProgress, namedContactRows);
+    emailsFound += await backfillFromPattern(target, onProgress, namedContactRows);
   }
+  if (emailsFound > 0) return { emailsFound, outcome: "found" };
 
-  filled += await backfillRoleInbox(target, onProgress);
-  return filled;
+  emailsFound += await backfillRoleInbox(target, onProgress);
+  return { emailsFound, outcome: emailsFound > 0 ? "found" : namedContactRows.length > 0 ? "exhausted_attempts" : "no_contacts" };
 }
 
 const DIRECTORY_HOSTS = [
@@ -91,13 +101,19 @@ function isDirectoryHost(domain: string): boolean {
   return DIRECTORY_HOSTS.some((host) => domain === host || domain.includes(host));
 }
 
-export async function backfillRoleInbox(target: EmailBackfillTarget, onProgress: ProgressSink): Promise<number> {
-  const domain = target.website
+export function websiteDomainOf(website: string | null | undefined): string | null {
+  if (!website) return null;
+  const domain = website
     .toLowerCase()
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
     .replace(/\/.*$/, "");
-  if (!domain.includes(".") || isDirectoryHost(domain)) return 0;
+  return domain.includes(".") ? domain : null;
+}
+
+export async function backfillRoleInbox(target: EmailBackfillTarget, onProgress: ProgressSink): Promise<number> {
+  const domain = websiteDomainOf(target.website);
+  if (!domain || isDirectoryHost(domain)) return 0;
   if (!websiteMatchesCompany(`https://${domain}`, target.companyName)) return 0;
 
   const [suppressed] = await db.select({ id: suppressions.id }).from(suppressions).where(eq(suppressions.domain, domain)).limit(1);
@@ -142,6 +158,9 @@ export async function backfillRoleInbox(target: EmailBackfillTarget, onProgress:
     inserted += rows.length;
   }
 
+  if (inserted > 0) {
+    await refreshCompanyEmailFlag(target.companyId);
+  }
   if (inserted > 0) onProgress("persist", `${inserted} role inbox(es) for "${target.companyName}" on ${domain}`);
   return inserted;
 }
@@ -176,6 +195,7 @@ async function backfillFromWebEvidence(target: EmailBackfillTarget, tracer: Harn
         updatedAt: new Date(),
       })
       .where(eq(contacts.id, row.id));
+    await refreshCompanyEmailFlag(target.companyId);
     filled += 1;
     onProgress(
       "persist",
@@ -224,6 +244,7 @@ async function backfillFromPattern(target: EmailBackfillTarget, onProgress: Prog
         updatedAt: new Date(),
       })
       .where(eq(contacts.id, row.id));
+    await refreshCompanyEmailFlag(target.companyId);
     filled += 1;
     onProgress(
       "persist",

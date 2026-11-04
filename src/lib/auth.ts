@@ -2,6 +2,7 @@ import { db } from "@src/db";
 import { sessions, users } from "@src/db/schema";
 import { and, eq, gt } from "drizzle-orm";
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createError } from "h3";
 import { promisify } from "node:util";
 
 const scrypt = promisify(scryptCallback) as (password: string, salt: Buffer, keylen: number) => Promise<Buffer>;
@@ -10,6 +11,10 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PASSWORD_KEYLEN = 64;
 
 export const SESSION_COOKIE = "prospectus_session";
+
+function createConflictError(reason: string): Error {
+  return createError({ statusCode: 409, statusMessage: reason, data: { reason } });
+}
 
 export interface SessionUser {
   id: string;
@@ -39,21 +44,6 @@ export async function verifyPassword(password: string, stored: string): Promise<
   const expected = Buffer.from(hashHex, "hex");
 
   return derived.length === expected.length && timingSafeEqual(derived, expected);
-}
-
-export async function registerUser(email: string, name: string, password: string): Promise<SessionUser> {
-  const passwordHash = await hashPassword(password);
-  const rows = await db.insert(users).values({ email: email.toLowerCase(), name, passwordHash }).returning();
-
-  const row = rows[0];
-
-  if (!row) throw new Error("user insert returned no rows");
-
-  return {
-    id: row.id,
-    email: row.email,
-    name: row.name,
-  };
 }
 
 export async function verifyLogin(email: string, password: string): Promise<SessionUser | null> {
@@ -100,6 +90,43 @@ export async function changePassword(userId: string, currentPassword: string, ne
   const passwordHash = await hashPassword(newPassword);
   await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
   return true;
+}
+
+export async function changeEmail(userId: string, newEmail: string): Promise<SessionUser> {
+  const email = newEmail.trim().toLowerCase();
+  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+  if (existing && existing.id !== userId) {
+    throw createConflictError("email_taken");
+  }
+  const [row] = await db.update(users).set({ email }).where(eq(users.id, userId)).returning();
+  if (!row) throw new Error("user not found");
+  return { id: row.id, email: row.email, name: row.name };
+}
+
+export async function createUser(email: string, name: string, password: string): Promise<SessionUser> {
+  const normalized = email.trim().toLowerCase();
+  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, normalized)).limit(1);
+  if (existing) {
+    throw createConflictError("email_taken");
+  }
+  const passwordHash = await hashPassword(password);
+  const [row] = await db.insert(users).values({ email: normalized, name, passwordHash }).returning();
+  if (!row) throw new Error("user insert returned no rows");
+  return { id: row.id, email: row.email, name: row.name };
+}
+
+export async function resetUserPassword(userId: string, newPassword: string): Promise<void> {
+  const passwordHash = await hashPassword(newPassword);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
+  await db.delete(sessions).where(eq(sessions.userId, userId));
+}
+
+export async function deleteUser(userId: string): Promise<void> {
+  await db.delete(users).where(eq(users.id, userId));
+}
+
+export async function listUsers(): Promise<Array<{ id: string; email: string; name: string; createdAt: Date }>> {
+  return db.select({ id: users.id, email: users.email, name: users.name, createdAt: users.createdAt }).from(users).orderBy(users.createdAt);
 }
 
 export async function getSessionUser(token: string | null | undefined): Promise<SessionUser | null> {

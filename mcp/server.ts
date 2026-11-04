@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
 import { z } from "zod";
 import { ToolError } from "./errors";
-import { runCampaignTools } from "./tools";
+import { runTools } from "./tools";
 import { runLlmTools } from "./llm-tools";
 import { findPrompt, promptList, promptMessages } from "./prompts";
 
@@ -147,7 +147,7 @@ async function handle(message: Record<string, unknown>): Promise<void> {
   if (id !== undefined) respondError(id, -32601, `method not found: ${method}`);
 }
 
-for (const definition of await runCampaignTools()) tool(definition);
+for (const definition of await runTools()) tool(definition);
 for (const definition of await runLlmTools()) tool(definition);
 
 function toToolError(error: unknown): { code: string; message: string } {

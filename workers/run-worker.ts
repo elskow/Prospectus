@@ -98,7 +98,7 @@ async function main(): Promise<number> {
         {
           campaignId,
           userId: request.userId ?? campaign.userId,
-          trigger: (claimed.trigger as "schedule" | "chat" | "manual") ?? "manual",
+          trigger: (claimed.trigger as "schedule" | "manual") ?? "manual",
           goalNewReadyLeads: request.goalNewReadyLeads ?? campaign.dailyLeadGoal,
           maxTurns: request.maxTurns ?? campaign.maxTurnsPerRun ?? null,
           maxWallClockHours: 12,

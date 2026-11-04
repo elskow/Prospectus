@@ -15,6 +15,10 @@ docker exec prospectus-postgres psql -U prospectus -d prospectus
 Lead-generation platform. A *campaign* (niche + area) is run by a goal loop that plans
 search queries with an LLM, scrapes Google Maps / web search / Instagram, extracts
 company candidates, qualifies them, harvests contacts, and syncs ready leads to a sink.
+On top of campaigns sits a **master-data layer**: directory ingest adapters (e.g.
+kemenperin) feed a global, deduplicated company/contact database with a validation
+gate; `/api/master/*` reads it, `/api/hunt/*` runs on-demand email hunts
+(`hunt_jobs`), and `/api/campaigns/import` promotes master companies into a campaign.
 
 Stack: Bun · Nuxt 4 (Nitro server routes) · Mastra agents · Drizzle ORM · Postgres
 (pgvector image) · self-hosted 9Router LLM gateway (`lavender`/`limo` provider ids).
@@ -59,7 +63,10 @@ else normalized name), `name`, `website`, `address`, `city`, `province`, `countr
 `latitude`, `longitude`, `phone`, `industry_category`, `products_services` (jsonb),
 `brief` + `brief_status`, `rating`, `review_count`, `digital_presence` (jsonb),
 `raw` (jsonb — holds `{ mapsPlaceUrl }` for Maps-sourced rows), `field_provenance` (jsonb),
-`created_by_run_id`.
+`created_by_run_id`, `status` (`valid` | `needs_review` | `rejected`; validation gate verdict,
+default `valid`), `has_email` (boolean, maintained flag recomputed from contacts on every
+contact write), `validation_notes` (jsonb array of `{ rule, message, at }` from the
+validation gate).
 
 **Dedupe is at the company level and is database-enforced** (`companies.dedupe_key` unique).
 A business re-found by any query in any run does NOT create a second company; the existing
@@ -90,7 +97,7 @@ overwrites good data with worse.
 
 ### runs — one execution
 `status` (`running` \| `succeeded` \| `failed` \| `cancelled`), `trigger`
-(`manual` \| `schedule` \| `chat`), `turns`, `cost_usd`, `resume_state` (jsonb, for paused
+(`manual` \| `schedule`), `turns`, `cost_usd`, `resume_state` (jsonb, for paused
 runs), `error`, `started_at`, **`heartbeat_at`** (updated every 60s while alive),
 `finished_at`.
 
@@ -145,14 +152,30 @@ job-boards, news, csv, google-sheets). `credentials` = encrypted adapter credent
 (**currently 0 rows** — every scrape runs unauthenticated). `lead_sources` = lead ↔ source
 provenance join.
 
+### hunt_jobs — on-demand email hunt (master data)
+| column | type | notes |
+|---|---|---|
+| `id` | uuid | PK |
+| `status` | text | `queued` \| `running` \| `succeeded` \| `failed` \| `cancelled`, default `queued` |
+| `filter` | jsonb | `{ limit, onlyNoEmail, companyIds, … }` |
+| `requested_count`, `processed_count`, `emails_found` | integer | progress counters |
+| `error` | text | set on `failed` |
+| `created_by_user_id` | uuid | FK → users, `on delete set null` |
+| `created_at` / `updated_at` / `finished_at` | timestamptz | lifecycle timestamps |
+
+Indexed by `hunt_jobs_status_idx` on `(status, created_at)`. Driven by `POST /api/hunt/jobs`,
+polled via `GET /api/hunt/jobs[/:id]`; each processed company gets the same
+crawls/role-inbox/pattern backfill pass as campaign enrichment and its `has_email`
+flag is refreshed after writes.
+
 ### models / app_settings
 `models` = catalog synced from the router's `/v1/models` (303 rows). `pricing` is empty for
 every model on this router, so cost accounting uses a flat fallback of $0.15/M in,
 $0.60/M out — **do not trust `runs.cost_usd` as model-accurate**.
 
 `app_settings` keys in use: `model-selection` (per-stage model ids for `planner`,
-`extractor`, `brief`, `chat`), and `geocode:<area>` cached bounding boxes.
-Current selection: all four stages = `limo/deepseek-v4.1-flash`.
+`extractor`), and `geocode:<area>` cached bounding boxes.
+Current selection: all stages = `limo/deepseek-v4.1-flash`.
 
 ---
 
@@ -293,3 +316,40 @@ where raw->>'mapsPlaceUrl' like '%!3d%' and (latitude is null or longitude is nu
   ≈ 5,000-9,000 artifacts. With parallel extraction (4-wide, 5-artifact chunks), a
   fallback model, 6-wide enrichment and 120-artifact Maps pages, that is roughly
   10-14 hours of run time; before those fixes it was 45-60 hours.
+
+---
+
+## 8. Master data (2026-11-02)
+
+Measured end-to-end on the live dev server (:3000), one continuous smoke run:
+
+| Metric | Measured |
+|---|---|
+| Before → after | 181 → 181 companies · 205 contacts with email (constant) · 12 → 12 leads · 16 → 17 ingest_jobs · 11 → 12 hunt_jobs |
+| `kemendag-exim` ingest, 1 page | 94 rows, 94 with email, 0 new companies, 0 duplicates, 5 rejected, 0 flagged, 1.7 s wall ("page budget reached") — a re-run yields 0 new companies because dedupe keys collide |
+| Validation gate on that page | 5 candidates rejected (blank/generic names); 2 companies persisted as `needs_review` (`validation_notes`: "email does not match basic email shape"), 179 `valid` |
+| `/api/master/companies?reachable=email&limit=5` | 5 rows, all `hasEmail=true`, one best contact each |
+| `/api/master/companies?q=DINAMIKA` | 1 hit (`1. PT. DINAMIKA SEJAHTERA MANDIRI *). AND`, hasEmail true). `q=Export` matches nothing — kemendag rows carry registry numbers (`/138.0009735.809`) and `PT …` names, not "Export" |
+| CSV export | header + one row per reachable company; kemendag rows have name+email only (city/website/phone null) |
+| Hunt (`limit:2, onlyNoEmail:true`) | `succeeded` with `requestedCount: 0` in <1 s — correct, not a failure: every company either already has an email, has no website, or is at the 2-attempt cap |
+| Hunt eligibility pool | 7/181 companies have a website, 3 are at the attempt cap, 0 currently eligible |
+| Import (2 companies, hunt:false) | `{"imported":0,"duplicates":2}` — both were already leads of the campaign |
+| `/api/master/stats` | `{ total: 181, withEmail: 177, needsReview: 2, rejected: 0 }` (60 s cache) |
+| `/master` UI | HTTP 200 |
+
+Gotchas observed:
+
+- **Hunt eligibility requires a website and `email_hunt_attempts < 2`.** Directory
+  adapters that capture emails directly (kemendag-exim rows all have one) leave almost
+  no hunt pool: master rows from directories have name+email but usually no website,
+  while Maps rows have websites but were already hunted twice. A `succeeded` job with
+  `requestedCount: 0` is the expected outcome when the pool is empty.
+- **`rejected` in an ingest response is a validation-gate verdict count** (candidates
+  never persisted), not a company status; `companies.status='rejected'` stays 0 unless a
+  human rejects.
+- **Import duplicates are counted per requested id**, not an error — re-importing the
+  same list is idempotent.
+- **`/api/master/stats` is cached for 60 s**; right after an ingest the counts may lag.
+- **has_email ≠ contacts.email count**: 181 companies but 205 contacts with email
+  (multiple contacts per company); `withEmail: 177` in stats is companies with ≥1
+  contact email.

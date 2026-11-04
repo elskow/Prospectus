@@ -1,10 +1,13 @@
 import { db } from "@src/db";
 import { campaigns, companies, contacts, leadSources, leads, queryLedger, suppressions } from "@src/db/schema";
 import { isRoleEmail, isPersonalLinkedInUrl, nameMatchesEmail } from "@src/harness/contact-discovery";
+import { validateCandidate, stampNotes, normalizePhone, isGenericCompanyName } from "@src/harness/validation";
+import type { ValidationVerdict } from "@src/harness/validation";
 import type { LeadCandidate, LeadContact } from "@src/harness/schemas";
 import type { SinkLead } from "@src/adapters/sink";
 import { and, count, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 
+export { normalizePhone, isGenericCompanyName } from "@src/harness/validation";
 export {
   startRun,
   finishRun,
@@ -24,8 +27,8 @@ export {
 export { recordQueryLedger, searchLedgerForCampaign, ensureSource } from "@src/harness/persist/query-ledger";
 
 export interface PersistInput {
-  campaignId: string;
-  runId: string;
+  campaignId: string | null;
+  runId: string | null;
   sourceId: string;
   candidates: LeadCandidate[];
 }
@@ -34,6 +37,8 @@ export interface PersistOutput {
   newCompanies: number;
   newLeads: number;
   duplicates: number;
+  rejected?: number;
+  flagged?: number;
 }
 
 export function fieldAgeDays(fieldProvenance: Record<string, unknown> | null, field: string): number | null {
@@ -90,14 +95,6 @@ function contactDedupeKey(companyDedupeKey: string, contact: LeadContact): strin
   if (!identity) return null;
 
   return `${companyDedupeKey}|contact|${identity.toLowerCase().replace(/[^a-z0-9.:@/-]+/g, "-")}`;
-}
-
-export function normalizePhone(raw: string): string | null {
-  const digits = raw.replace(/[^0-9+]/g, "");
-  let national = digits.replace(/^\+?62/, "0").replace(/\D/g, "");
-  if (national.startsWith("62")) national = `0${national.slice(2)}`;
-  if (!national.startsWith("0") || national.length < 9 || national.length > 14) return null;
-  return `+62${national.slice(1)}`;
 }
 
 export function waLikely(phoneNormalized: string | null): boolean {
@@ -161,6 +158,8 @@ async function upsertContacts(companyDedupeKey: string, companyId: string, input
         },
       });
 
+    if (contact.email) await refreshCompanyEmailFlag(companyId);
+
     saved += 1;
   }
 
@@ -182,6 +181,7 @@ export async function upsertCrawledContacts(input: {
   }[];
 }): Promise<number> {
   let saved = 0;
+  const companiesWithEmail = new Set<string>();
   const provenance = { stage: "site-crawl", runId: input.runId, at: new Date().toISOString() };
   for (const person of input.people) {
     const linkedinUrl = isPersonalLinkedInUrl(person.linkedinUrl) ? person.linkedinUrl : null;
@@ -226,8 +226,10 @@ export async function upsertCrawledContacts(input: {
           fieldProvenance: sql`${contacts.fieldProvenance} || ${JSON.stringify({ contact: provenance })}::jsonb`,
         },
       });
+    if (person.email) companiesWithEmail.add(input.companyId);
     saved += 1;
   }
+  for (const companyId of companiesWithEmail) await refreshCompanyEmailFlag(companyId);
   return saved;
 }
 
@@ -309,129 +311,260 @@ export async function companyContactCount(companyId: string): Promise<number> {
   return Number(row?.n ?? 0);
 }
 
-const GENERIC_NAME_PATTERN =
-  /^(perusahaan|pt|cv|ud|kantor|toko|usaha|bisnis|company|business|pabrik|distributor|supplier|vendor|agent|agen)(\s+(manufaktur|manufacturing|industri|industry|umum|general|jasa|services|logistik|logistics|konsultan|consulting|teknik|engineering|dagang|trading|spbu|grosir|wholesale|eceran|retail))?$/i;
-
-export function isGenericCompanyName(name: string): boolean {
-  const normalized = name.trim().replace(/\s+/g, " ");
-  if (normalized.length < 3) return true;
-  return GENERIC_NAME_PATTERN.test(normalized);
-}
-
 export async function persistCandidates(input: PersistInput): Promise<PersistOutput> {
-  const result: PersistOutput = { newCompanies: 0, newLeads: 0, duplicates: 0 };
+  const result: PersistOutput = { newCompanies: 0, newLeads: 0, duplicates: 0, rejected: 0, flagged: 0 };
 
-  const [campaign] = await db.select({ exclusions: campaigns.exclusions }).from(campaigns).where(eq(campaigns.id, input.campaignId));
+  const [campaign] = input.campaignId ? await db.select({ exclusions: campaigns.exclusions }).from(campaigns).where(eq(campaigns.id, input.campaignId)) : [];
   const exclusions = campaign?.exclusions ?? [];
 
+  const accepted: {
+    candidate: LeadCandidate;
+    dedupeKey: string;
+    coords: { lat: number; lng: number } | null;
+    verdict: ValidationVerdict;
+  }[] = [];
   for (const candidate of input.candidates) {
     if (isGenericCompanyName(candidate.name)) {
-      result.duplicates += 1;
+      result.rejected = (result.rejected ?? 0) + 1;
       continue;
+    }
+    const verdict = validateCandidate({
+      name: candidate.name,
+      email: candidate.contacts?.find((c) => c.email)?.email ?? null,
+      phone: candidate.phone,
+      website: candidate.website,
+      country: candidate.country,
+    });
+    if (verdict.level === "reject") {
+      result.rejected = (result.rejected ?? 0) + 1;
+      continue;
+    }
+    if (verdict.level === "review") {
+      result.flagged = (result.flagged ?? 0) + 1;
     }
     if (matchesExclusions(candidate, exclusions)) {
-      result.duplicates += 1;
+      result.rejected = (result.rejected ?? 0) + 1;
       continue;
     }
-    const dedupeKey = dedupeKeyFor(candidate);
-    const coords = mapsUrlCoords(candidate.sourceUrl);
-    const inserted = await db
+    accepted.push({ candidate, dedupeKey: dedupeKeyFor(candidate), coords: mapsUrlCoords(candidate.sourceUrl), verdict });
+  }
+
+  if (accepted.length === 0) return result;
+  await db.transaction(async (tx) => {
+    const db = tx;
+
+    const byDedupeKey = new Map<string, { candidate: LeadCandidate; coords: { lat: number; lng: number } | null }>();
+    for (const row of accepted) byDedupeKey.set(row.dedupeKey, { candidate: row.candidate, coords: row.coords });
+    const occurrences = new Map<string, number>();
+    for (const row of accepted) occurrences.set(row.dedupeKey, (occurrences.get(row.dedupeKey) ?? 0) + 1);
+
+    const provenanceAt = new Date().toISOString();
+    const insertedRows = await db
       .insert(companies)
-      .values({
-        dedupeKey,
-        name: candidate.name,
-        website: candidate.website ?? null,
-        address: candidate.address ?? null,
-        city: candidate.city ?? null,
-        phone: candidate.phone ?? null,
-        industryCategory: candidate.category ?? null,
-        rating: candidate.rating ?? null,
-        reviewCount: candidate.reviewCount ?? null,
-        productsServices: candidate.productsServices ?? null,
-        latitude: coords?.lat ?? null,
-        longitude: coords?.lng ?? null,
-        raw: candidate.sourceUrl ? { mapsPlaceUrl: candidate.sourceUrl } : null,
-        fieldProvenance: {
-          name: { sourceId: input.sourceId, stage: "discover", runId: input.runId, at: new Date().toISOString() },
-        },
-        createdByRunId: input.runId,
-      })
+      .values(
+        accepted.map((row) => {
+          const coords = row.coords;
+          return {
+            dedupeKey: row.dedupeKey,
+            name: row.candidate.name,
+            website: row.candidate.website ?? null,
+            address: row.candidate.address ?? null,
+            city: row.candidate.city ?? null,
+            province: row.candidate.province ?? null,
+            ...(row.candidate.country ? { country: row.candidate.country } : {}),
+            phone: row.candidate.phone ?? null,
+            industryCategory: row.candidate.category ?? null,
+            rating: row.candidate.rating ?? null,
+            reviewCount: row.candidate.reviewCount ?? null,
+            productsServices: row.candidate.productsServices ?? null,
+            latitude: coords?.lat ?? null,
+            longitude: coords?.lng ?? null,
+            raw: row.candidate.raw ?? (row.candidate.sourceUrl ? { mapsPlaceUrl: row.candidate.sourceUrl } : null),
+            fieldProvenance: {
+              name: { sourceId: input.sourceId, stage: "discover", runId: input.runId, at: provenanceAt },
+            },
+            createdByRunId: input.runId,
+            status: row.verdict.level === "review" ? ("needs_review" as const) : ("valid" as const),
+            hasEmail: row.candidate.contacts?.some((c) => c.email) ?? false,
+            validationNotes: row.verdict.level === "review" ? stampNotes(row.verdict.notes) : [],
+          };
+        }),
+      )
       .onConflictDoNothing({ target: companies.dedupeKey })
-      .returning({ id: companies.id });
+      .returning({ id: companies.id, dedupeKey: companies.dedupeKey });
 
-    let companyId = inserted[0]?.id;
+    const companyIdByKey = new Map<string, string>();
+    for (const row of insertedRows) companyIdByKey.set(row.dedupeKey, row.id);
+    result.newCompanies += insertedRows.length;
 
-    if (!companyId) {
-      const [existing] = await db.select({ id: companies.id }).from(companies).where(eq(companies.dedupeKey, dedupeKey));
-      if (!existing) {
+    const conflictedKeys = [...byDedupeKey.keys()].filter((key) => !companyIdByKey.has(key));
+    if (conflictedKeys.length > 0) {
+      const existingRows = await db
+        .select({ id: companies.id, dedupeKey: companies.dedupeKey })
+        .from(companies)
+        .where(inArray(companies.dedupeKey, conflictedKeys));
+      for (const row of existingRows) companyIdByKey.set(row.dedupeKey, row.id);
+
+      const coordKeys = conflictedKeys.filter((key) => byDedupeKey.get(key)?.coords && companyIdByKey.has(key));
+      if (coordKeys.length > 0) {
+        await db.execute(sql`
+        update companies set latitude = data.lat, longitude = data.lng, updated_at = now()
+        from (values ${sql.join(
+          coordKeys.map((key) => {
+            const coords = byDedupeKey.get(key)!.coords!;
+            return sql`( ${companyIdByKey.get(key)!}::uuid, ${coords.lat}::double precision, ${coords.lng}::double precision )`;
+          }),
+          sql`, `,
+        )} ) as data(id, lat, lng)
+        where companies.id = data.id and (companies.latitude is null or companies.longitude is null)
+      `);
+      }
+    }
+
+    const contactsByKey = new Map<string, typeof contacts.$inferInsert>();
+    const phoneOnlyValues: (typeof contacts.$inferInsert)[] = [];
+    const emailedCompanyIds = new Set<string>();
+    for (const [dedupeKey, entry] of byDedupeKey) {
+      const companyId = companyIdByKey.get(dedupeKey);
+      if (!companyId) {
         result.duplicates += 1;
         continue;
       }
-      companyId = existing.id;
-      if (coords) {
-        await db
-          .update(companies)
-          .set({ latitude: coords.lat, longitude: coords.lng })
-          .where(and(eq(companies.id, companyId), sql`(${companies.latitude} is null or ${companies.longitude} is null)`));
+      const provenance = {
+        sourceId: input.sourceId,
+        stage: "discover",
+        runId: input.runId,
+        at: provenanceAt,
+      };
+      const namedContacts = (entry.candidate.contacts ?? []).filter((contact) => contactDedupeKey(dedupeKey, contact) !== null);
+      for (const contact of namedContacts) {
+        const dedupeKeyContact = contactDedupeKey(dedupeKey, contact)!;
+        const phoneNormalized = contact.phone ? normalizePhone(contact.phone) : null;
+        if (contactsByKey.has(dedupeKeyContact)) continue;
+        contactsByKey.set(dedupeKeyContact, {
+          dedupeKey: dedupeKeyContact,
+          companyId,
+          name: contact.name ?? null,
+          title: contact.title ?? (contact.email && isRoleEmail(contact.email) && !contact.name ? "company/role inbox" : null),
+          email: contact.email ?? null,
+          phone: contact.phone ?? null,
+          phoneNormalized,
+          waLikely: phoneNormalized ? waLikely(phoneNormalized) : null,
+          emailType: contact.email
+            ? isRoleEmail(contact.email)
+              ? "role"
+              : contact.name && nameMatchesEmail(contact.name, contact.email)
+                ? "personal"
+                : null
+            : null,
+          linkedinUrl: contact.linkedinUrl ?? null,
+          isDecisionMaker: contact.isDecisionMaker ?? null,
+          raw: contact,
+          fieldProvenance: { contact: provenance },
+        });
+        if (contact.email) emailedCompanyIds.add(companyId);
       }
-    } else {
-      result.newCompanies += 1;
-    }
-
-    await upsertContacts(dedupeKey, companyId, input, candidate);
-
-    if (candidate.phone) {
-      const identity = `phone:${candidate.phone}`.toLowerCase().replace(/[^a-z0-9.:@/-]+/g, "-");
-      await db
-        .insert(contacts)
-        .values({
+      if (entry.candidate.phone) {
+        const identity = `phone:${entry.candidate.phone}`.toLowerCase().replace(/[^a-z0-9.:@/-]+/g, "-");
+        phoneOnlyValues.push({
           dedupeKey: `${dedupeKey}|contact|${identity}`,
           companyId,
           name: null,
           title: null,
           email: null,
           emailType: null,
-          phone: candidate.phone,
-          phoneNormalized: normalizePhone(candidate.phone),
+          phone: entry.candidate.phone,
+          phoneNormalized: normalizePhone(entry.candidate.phone),
           waLikely: null,
           whatsapp: null,
           linkedinUrl: null,
           isDecisionMaker: null,
           raw: null,
-          fieldProvenance: { phone: { stage: "discover", sourceId: input.sourceId, runId: input.runId, at: new Date().toISOString() } },
-        })
-        .onConflictDoNothing({ target: contacts.dedupeKey });
+          fieldProvenance: { phone: { stage: "discover", sourceId: input.sourceId, runId: input.runId, at: provenanceAt } },
+        });
+      }
     }
 
-    const [existingLead] = await db
-      .select({ id: leads.id })
+    const contactValues = [...contactsByKey.values()];
+    if (contactValues.length > 0) {
+      await db
+        .insert(contacts)
+        .values(contactValues)
+        .onConflictDoUpdate({
+          target: contacts.dedupeKey,
+          set: {
+            name: sql`coalesce(${contacts.name}, excluded.name)`,
+            title: sql`coalesce(${contacts.title}, excluded.title)`,
+            email: sql`coalesce(${contacts.email}, excluded.email)`,
+            emailType: sql`coalesce(${contacts.emailType}, excluded.email_type)`,
+            phone: sql`coalesce(${contacts.phone}, excluded.phone)`,
+            phoneNormalized: sql`coalesce(${contacts.phoneNormalized}, excluded.phone_normalized)`,
+            waLikely: sql`coalesce(${contacts.waLikely}, excluded.wa_likely)`,
+            linkedinUrl: sql`coalesce(${contacts.linkedinUrl}, excluded.linkedin_url)`,
+            isDecisionMaker: sql`coalesce(${contacts.isDecisionMaker}, excluded.is_decision_maker)`,
+            raw: sql`excluded.raw`,
+            fieldProvenance: sql`${contacts.fieldProvenance} || excluded.field_provenance`,
+          },
+        });
+    }
+
+    if (phoneOnlyValues.length > 0) {
+      await db.insert(contacts).values(phoneOnlyValues).onConflictDoNothing({ target: contacts.dedupeKey });
+    }
+
+    if (emailedCompanyIds.size > 0) {
+      await db
+        .update(companies)
+        .set({ hasEmail: true, updatedAt: new Date() })
+        .where(and(inArray(companies.id, [...emailedCompanyIds]), eq(companies.hasEmail, false)));
+    }
+
+    if (!input.campaignId) return result;
+
+    const pagedCompanyIds = [...new Set(companyIdByKey.values())];
+    const existingLeadRows = await db
+      .select({ id: leads.id, companyId: leads.companyId })
       .from(leads)
-      .where(and(eq(leads.campaignId, input.campaignId), eq(leads.companyId, companyId)));
+      .where(and(eq(leads.campaignId, input.campaignId), inArray(leads.companyId, pagedCompanyIds)));
+    const leadIdByCompanyId = new Map<string, string>();
+    for (const row of existingLeadRows) leadIdByCompanyId.set(row.companyId, row.id);
 
-    if (existingLead) {
-      result.duplicates += 1;
-      await db.insert(leadSources).values({ leadId: existingLead.id, sourceId: input.sourceId }).onConflictDoNothing();
-      continue;
+    for (const companyId of pagedCompanyIds) {
+      if (leadIdByCompanyId.has(companyId)) result.duplicates += 1;
     }
 
-    const [lead] = await db
-      .insert(leads)
-      .values({
-        companyId,
-        campaignId: input.campaignId,
-        status: "new",
-        createdByRunId: input.runId,
-      })
-      .returning({ id: leads.id });
-
-    if (!lead) {
-      result.duplicates += 1;
-      continue;
+    for (const [key, count] of occurrences) {
+      const companyId = companyIdByKey.get(key);
+      if (count > 1 && companyId !== undefined && leadIdByCompanyId.has(companyId)) result.duplicates += count - 1;
     }
 
-    await db.insert(leadSources).values({ leadId: lead.id, sourceId: input.sourceId }).onConflictDoNothing();
-    result.newLeads += 1;
-  }
+    const freshCompanyIds = pagedCompanyIds.filter((companyId) => !leadIdByCompanyId.has(companyId));
+    if (freshCompanyIds.length > 0) {
+      const insertedLeads = await db
+        .insert(leads)
+        .values(
+          freshCompanyIds.map((companyId) => ({
+            companyId,
+            campaignId: input.campaignId!,
+            status: "new" as const,
+            createdByRunId: input.runId,
+          })),
+        )
+        .onConflictDoNothing({ target: [leads.campaignId, leads.companyId] })
+        .returning({ id: leads.id, companyId: leads.companyId });
+      result.newLeads += insertedLeads.length;
+      const racedCompanyIds = freshCompanyIds.filter((companyId) => !insertedLeads.some((lead) => lead.companyId === companyId));
+      for (const companyId of racedCompanyIds) result.duplicates += 1;
+      for (const lead of insertedLeads) leadIdByCompanyId.set(lead.companyId, lead.id);
+    }
+
+    const leadSourceValues = [...leadIdByCompanyId.entries()]
+      .filter(([companyId]) => pagedCompanyIds.includes(companyId))
+      .map(([companyId, leadId]) => ({ leadId, sourceId: input.sourceId }));
+    if (leadSourceValues.length > 0) {
+      await db.insert(leadSources).values(leadSourceValues).onConflictDoNothing();
+    }
+  });
 
   return result;
 }
@@ -446,6 +579,12 @@ export function matchesExclusions(candidate: LeadCandidate, exclusions: string[]
     const needle = term.trim().toLowerCase();
     return needle.length > 1 && haystack.includes(needle);
   });
+}
+
+export async function refreshCompanyEmailFlag(companyId: string): Promise<boolean> {
+  const hasEmail = await companyHasEmail(companyId);
+  await db.update(companies).set({ hasEmail, updatedAt: new Date() }).where(eq(companies.id, companyId));
+  return hasEmail;
 }
 
 export async function promoteReadyLeads(campaignId: string): Promise<number> {
@@ -463,20 +602,52 @@ export async function promoteReadyLeads(campaignId: string): Promise<number> {
   return rows[0]?.count ?? 0;
 }
 
+export interface ReadyLeadExport {
+  leadId: string;
+  lead: SinkLead;
+}
+
+const suppressionCache: { emails: Set<string>; domains: Set<string>; loadedAt: number } = {
+  emails: new Set(),
+  domains: new Set(),
+  loadedAt: 0,
+};
+
+const SUPPRESSION_CACHE_TTL_MS = 60_000;
+
+export function invalidateSuppressionCache(): void {
+  suppressionCache.emails = new Set();
+  suppressionCache.domains = new Set();
+  suppressionCache.loadedAt = 0;
+}
+
+async function suppressionSets(): Promise<{ emails: Set<string>; domains: Set<string> }> {
+  if (suppressionCache.loadedAt > 0 && Date.now() - suppressionCache.loadedAt < SUPPRESSION_CACHE_TTL_MS) {
+    return { emails: suppressionCache.emails, domains: suppressionCache.domains };
+  }
+  const rows = await db.select({ email: suppressions.email, domain: suppressions.domain }).from(suppressions);
+  const emails = new Set<string>();
+  const domains = new Set<string>();
+  for (const row of rows) {
+    if (row.email) emails.add(row.email.toLowerCase());
+    if (row.domain) domains.add(row.domain.toLowerCase());
+  }
+  suppressionCache.emails = emails;
+  suppressionCache.domains = domains;
+  suppressionCache.loadedAt = Date.now();
+  return { emails, domains };
+}
+
 export async function findReadyLeads(campaignId: string): Promise<SinkLead[]> {
+  return (await findReadyLeadsWithIds(campaignId)).map((entry) => entry.lead);
+}
+
+export async function findReadyLeadsWithIds(campaignId: string): Promise<ReadyLeadExport[]> {
   const [campaign] = await db.select({ exportMode: campaigns.exportMode }).from(campaigns).where(eq(campaigns.id, campaignId));
   const perCompany = campaign?.exportMode !== "all_contacts";
+  const rankLimit = perCompany ? 1 : 5;
 
-  const suppressedEmails = new Set(
-    (await db.select({ email: suppressions.email }).from(suppressions))
-      .map((row) => row.email?.toLowerCase())
-      .filter((email): email is string => Boolean(email)),
-  );
-  const suppressedDomains = new Set(
-    (await db.select({ domain: suppressions.domain }).from(suppressions))
-      .map((row) => row.domain?.toLowerCase())
-      .filter((domain): domain is string => Boolean(domain)),
-  );
+  const { emails: suppressedEmails, domains: suppressedDomains } = await suppressionSets();
   const isSuppressed = (email: string | null): boolean => {
     if (!email) return false;
     const lower = email.toLowerCase();
@@ -484,6 +655,14 @@ export async function findReadyLeads(campaignId: string): Promise<SinkLead[]> {
     const domain = lower.split("@")[1] ?? "";
     return domain.length > 0 && suppressedDomains.has(domain);
   };
+
+  const pagedLeadIds = await db
+    .select({ id: leads.id })
+    .from(leads)
+    .where(and(eq(leads.campaignId, campaignId), eq(leads.status, "ready"), isNull(leads.sheetSyncedAt)))
+    .limit(500);
+
+  if (pagedLeadIds.length === 0) return [];
 
   const rows = await db
     .select({
@@ -493,72 +672,107 @@ export async function findReadyLeads(campaignId: string): Promise<SinkLead[]> {
       website: companies.website,
       sourceUrl: companies.raw,
       discoveredAt: leads.createdAt,
+      contactName: contacts.name,
+      contactTitle: contacts.title,
+      contactEmail: contacts.email,
+      emailVerification: contacts.emailVerification,
+      contactPhone: contacts.phone,
+      contactPhoneNormalized: contacts.phoneNormalized,
+      contactWhatsapp: contacts.whatsapp,
+      contactIsDecisionMaker: contacts.isDecisionMaker,
     })
     .from(leads)
     .innerJoin(companies, eq(leads.companyId, companies.id))
-    .where(and(eq(leads.campaignId, campaignId), eq(leads.status, "ready"), isNull(leads.sheetSyncedAt)))
-    .limit(500);
+    .leftJoin(
+      contacts,
+      and(
+        eq(contacts.companyId, companies.id),
+        sql`(${contacts.email} is not null or ${contacts.phone} is not null or ${contacts.whatsapp} is not null or ${contacts.phoneNormalized} is not null)`,
+      ),
+    )
+    .where(
+      inArray(
+        leads.id,
+        pagedLeadIds.map((row) => row.id),
+      ),
+    );
 
-  const enriched: SinkLead[] = [];
+  const byLead = new Map<string, typeof rows>();
+  const leadOrder: string[] = [];
   for (const row of rows) {
-    const companyId = await companyIdOfLead(row.leadId);
-    if (!companyId) continue;
-    const contactRows = await db
-      .select({
-        name: contacts.name,
-        title: contacts.title,
-        email: contacts.email,
-        emailVerification: contacts.emailVerification,
-        phone: contacts.phone,
-        phoneNormalized: contacts.phoneNormalized,
-        whatsapp: contacts.whatsapp,
-        isDecisionMaker: contacts.isDecisionMaker,
-      })
-      .from(contacts)
-      .where(
-        and(
-          eq(contacts.companyId, companyId),
-          sql`(${contacts.email} is not null or ${contacts.phone} is not null or ${contacts.whatsapp} is not null or ${contacts.phoneNormalized} is not null)`,
-        ),
-      );
+    if (!byLead.has(row.leadId)) {
+      byLead.set(row.leadId, []);
+      leadOrder.push(row.leadId);
+    }
+    byLead.get(row.leadId)!.push(row);
+  }
 
-    const eligible = contactRows.filter((contact) => !isSuppressed(contact.email));
-    const ranked = [...eligible].sort((a, b) => rankContact(b) - rankContact(a)).slice(0, perCompany ? 1 : 5);
-    const sourceUrl = (row.sourceUrl as { mapsPlaceUrl?: string } | null)?.mapsPlaceUrl ?? null;
+  const enriched: ReadyLeadExport[] = [];
+  for (const leadId of leadOrder) {
+    const contactRows = byLead.get(leadId)!;
+    const head = contactRows[0]!;
+    const eligible = contactRows.filter((row) => !isSuppressed(row.contactEmail));
+    const ranked = [...eligible].sort((a, b) => rankContact(toRankInput(b)) - rankContact(toRankInput(a))).slice(0, rankLimit);
+    const sourceUrl = (head.sourceUrl as { mapsPlaceUrl?: string } | null)?.mapsPlaceUrl ?? null;
+    const discoveredAt = head.discoveredAt ? head.discoveredAt.toISOString() : null;
     for (const c of ranked) {
       enriched.push({
-        companyName: row.companyName,
-        city: row.city,
-        website: row.website,
-        contactName: c.name,
-        contactTitle: c.title,
-        contactEmail: c.email,
-        emailVerification: c.emailVerification,
-        contactPhone: c.phoneNormalized ?? c.phone,
-        contactWhatsapp: c.whatsapp,
-        isDecisionMaker: c.isDecisionMaker,
-        sourceUrl,
-        discoveredAt: row.discoveredAt ? row.discoveredAt.toISOString() : null,
+        leadId,
+        lead: {
+          companyName: head.companyName,
+          city: head.city,
+          website: head.website,
+          contactName: c.contactName,
+          contactTitle: c.contactTitle,
+          contactEmail: c.contactEmail,
+          emailVerification: c.emailVerification,
+          contactPhone: c.contactPhoneNormalized ?? c.contactPhone,
+          contactWhatsapp: c.contactWhatsapp,
+          isDecisionMaker: c.contactIsDecisionMaker,
+          sourceUrl,
+          discoveredAt,
+        },
       });
     }
     if (ranked.length === 0) {
       enriched.push({
-        companyName: row.companyName,
-        city: row.city,
-        website: row.website,
-        contactName: null,
-        contactTitle: null,
-        contactEmail: null,
-        emailVerification: null,
-        contactPhone: null,
-        contactWhatsapp: null,
-        isDecisionMaker: null,
-        sourceUrl,
-        discoveredAt: row.discoveredAt ? row.discoveredAt.toISOString() : null,
+        leadId,
+        lead: {
+          companyName: head.companyName,
+          city: head.city,
+          website: head.website,
+          contactName: null,
+          contactTitle: null,
+          contactEmail: null,
+          emailVerification: null,
+          contactPhone: null,
+          contactWhatsapp: null,
+          isDecisionMaker: null,
+          sourceUrl,
+          discoveredAt,
+        },
       });
     }
   }
   return enriched;
+}
+
+function toRankInput(c: {
+  contactIsDecisionMaker: boolean | null;
+  contactName: string | null;
+  contactEmail: string | null;
+  contactWhatsapp: string | null;
+  contactPhone: string | null;
+  contactPhoneNormalized: string | null;
+}) {
+  return {
+    isDecisionMaker: c.contactIsDecisionMaker,
+    name: c.contactName,
+    email: c.contactEmail,
+    whatsapp: c.contactWhatsapp,
+    phone: c.contactPhone,
+    phoneNormalized: c.contactPhoneNormalized,
+  };
 }
 
 function rankContact(c: {
@@ -576,11 +790,6 @@ function rankContact(c: {
   if (c.whatsapp || waLikely(c.phoneNormalized)) score += 3;
   if (c.phone) score += 1;
   return score;
-}
-
-async function companyIdOfLead(leadId: string): Promise<string | null> {
-  const [row] = await db.select({ companyId: leads.companyId }).from(leads).where(eq(leads.id, leadId));
-  return row?.companyId ?? null;
 }
 
 export async function getQueryYields(campaignId: string): Promise<Map<string, { crawled: number; ready: number }>> {
@@ -644,15 +853,7 @@ export async function ensureContactEmailRow(input: {
       fieldProvenance: { contact: { stage: "email-finder", at: new Date().toISOString() } },
     })
     .onConflictDoNothing({ target: contacts.dedupeKey });
-}
-
-export async function findReadyLeadIds(campaignId: string): Promise<string[]> {
-  const rows = await db
-    .select({ id: leads.id })
-    .from(leads)
-    .where(and(eq(leads.campaignId, campaignId), eq(leads.status, "ready"), isNull(leads.sheetSyncedAt)))
-    .limit(1000);
-  return rows.map((r) => r.id);
+  await refreshCompanyEmailFlag(input.companyId);
 }
 
 export async function markLeadsSynced(leadIds: string[]): Promise<void> {

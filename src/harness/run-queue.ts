@@ -40,7 +40,7 @@ export async function activeRunCount(): Promise<number> {
 
 export async function enqueueRun(input: {
   campaignId: string;
-  trigger: "schedule" | "chat" | "manual";
+  trigger: "schedule" | "manual";
   request: RunRequest;
   idempotencyKey?: string | null;
 }): Promise<{ id: string; created: boolean; reason?: "exists" | "capacity" }> {

@@ -505,7 +505,7 @@ onMounted(load);
 
       <div v-if="leads.length === 0" class="mt-3 rounded-lg border border-dashed border-border bg-card p-8 text-center">
         <p class="text-sm font-medium">No prospects yet</p>
-        <p class="mt-1 text-sm text-muted-foreground">Hit "Run now" to start hunting, or ask for leads in the chat.</p>
+        <p class="mt-1 text-sm text-muted-foreground">Hit "Run now" to start hunting.</p>
       </div>
       <div v-else-if="filteredLeads.length === 0" class="mt-3 rounded-lg border border-dashed border-border bg-card p-8 text-center">
         <p class="text-sm font-medium">No {{ statusFilter }} prospects</p>
@@ -649,7 +649,7 @@ onMounted(load);
       <DialogContent class="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Campaign settings</DialogTitle>
-          <DialogDescription>Applies to the next run. Chat can also change these.</DialogDescription>
+          <DialogDescription>Applies to the next run.</DialogDescription>
         </DialogHeader>
         <div class="space-y-4 py-2">
           <div class="space-y-1.5">

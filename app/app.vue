@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Toaster, toast } from "vue-sonner";
-import { BarChart3, LogOut, MessageSquare, Settings } from "lucide-vue-next";
+import { BarChart3, Database, LogOut, Settings, Users } from "lucide-vue-next";
 import "vue-sonner/style.css";
 
 const route = useRoute();
@@ -23,9 +23,10 @@ onMounted(async () => {
 });
 
 const nav = [
-  { to: "/", label: "Chat", icon: "chat" },
   { to: "/campaigns", label: "Campaigns", icon: "campaigns" },
+  { to: "/master", label: "Master", icon: "master" },
   { to: "/settings", label: "Settings", icon: "settings" },
+  { to: "/users", label: "Users", icon: "users" },
 ];
 
 function isActive(to: string) {
@@ -67,9 +68,10 @@ const initials = computed(() => {
           ]"
           :aria-current="isActive(item.to) ? 'page' : undefined"
         >
-          <MessageSquare v-if="item.icon === 'chat'" class="size-4" aria-hidden="true" />
-          <BarChart3 v-else-if="item.icon === 'campaigns'" class="size-4" aria-hidden="true" />
-          <Settings v-else class="size-4" aria-hidden="true" />
+          <BarChart3 v-if="item.icon === 'campaigns'" class="size-4" aria-hidden="true" />
+          <Database v-else-if="item.icon === 'master'" class="size-4" aria-hidden="true" />
+          <Settings v-else-if="item.icon === 'settings'" class="size-4" aria-hidden="true" />
+          <Users v-else class="size-4" aria-hidden="true" />
           {{ item.label }}
         </NuxtLink>
       </nav>

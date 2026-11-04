@@ -3,7 +3,7 @@ import { db } from "@src/db";
 import { runs } from "@src/db/schema";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
-export async function startRun(campaignId: string, trigger: "schedule" | "chat" | "manual", queuedRunId?: string): Promise<string | null> {
+export async function startRun(campaignId: string, trigger: "schedule" | "manual", queuedRunId?: string): Promise<string | null> {
   if (queuedRunId) {
     const claimed = await db.execute<{ id: string }>(sql`
       update runs

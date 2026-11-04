@@ -30,6 +30,9 @@ export default defineNuxtConfig({
   future: {
     compatibilityVersion: 4,
   },
+  routeRules: {
+    "/": { redirect: "/campaigns" },
+  },
   srcDir: "app/",
   runtimeConfig: {
     databaseUrl: process.env.DATABASE_URL,

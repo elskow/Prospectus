@@ -25,7 +25,7 @@ export interface GoalLoopDeps {
 export interface GoalLoopOptions {
   campaignId: string;
   userId: string;
-  trigger: "schedule" | "chat" | "manual";
+  trigger: "schedule" | "manual";
   goalNewReadyLeads: number;
   maxTurns?: number | null;
   maxWallClockHours?: number;

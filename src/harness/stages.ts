@@ -1,6 +1,5 @@
 import type { EnrichableCompany, EnrichmentResult } from "@src/adapters/types";
 import { expansionSchema, extractionSchema, queryPlanSchema, type LeadCandidate, type QueryPlan } from "@src/harness/schemas";
-import { webSearchTool } from "@src/mastra/tools/web-search";
 import { leadExtractorAgent, mastra, queryPlannerAgent, modelForId } from "@src/mastra";
 
 const EXTRACTION_FALLBACK_MODEL = process.env.EXTRACTION_FALLBACK_MODEL ?? "oao/deepseek-v4.1-flash";

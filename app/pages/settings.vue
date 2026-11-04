@@ -54,7 +54,6 @@ for (const adapter of adapters.value) sourceTypeLabels[adapter.type] = adapter.l
 const STAGE_LABELS: { key: StageKey; label: string; hint: string }[] = [
   { key: "planner", label: "Query planner", hint: "Turns the ICP into search queries" },
   { key: "extractor", label: "Lead extractor", hint: "Pulls candidates from scraped results" },
-  { key: "chat", label: "Chat assistant", hint: "Conversational assistant and memory observations" },
 ];
 
 async function loadModels() {
@@ -463,9 +462,7 @@ onMounted(async () => {
         <div class="flex items-center justify-between">
           <div>
             <h2 id="models-heading" class="text-sm font-semibold uppercase tracking-widest text-muted-foreground">Models</h2>
-            <p class="mt-1 text-sm text-muted-foreground">
-              Pick which provider and model each agent stage uses. Changes apply to the next run or chat message.
-            </p>
+            <p class="mt-1 text-sm text-muted-foreground">Pick which provider and model each agent stage uses. Changes apply to the next run.</p>
           </div>
           <Button type="button" variant="outline" size="sm" :disabled="modelBusy" @click="syncModels">Sync catalog</Button>
         </div>

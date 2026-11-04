@@ -5,11 +5,9 @@ definePageMeta({ middleware: "guest" });
 
 useHead({ title: "Sign in · Prospectus" });
 
-const { login, register } = useAuth();
+const { login } = useAuth();
 
-const mode = ref<"login" | "register">("login");
 const email = ref("");
-const name = ref("");
 const password = ref("");
 const error = ref<string | null>(null);
 const pending = ref(false);
@@ -18,24 +16,13 @@ async function submit() {
   error.value = null;
   pending.value = true;
   try {
-    if (mode.value === "login") {
-      await login(email.value, password.value);
-    } else {
-      await register(email.value, name.value, password.value);
-    }
+    await login(email.value, password.value);
     await navigateTo("/settings");
   } catch (err) {
     error.value = friendlyError(err);
   } finally {
     pending.value = false;
   }
-}
-
-function fillExample() {
-  mode.value = "register";
-  name.value = "Demo User";
-  email.value = "demo@example.com";
-  password.value = "demo-password-123";
 }
 </script>
 
@@ -48,63 +35,26 @@ function fillExample() {
       </NuxtLink>
 
       <div class="flex flex-1 flex-col justify-center pb-16">
-        <h1 class="text-center text-xl font-bold tracking-tight">
-          {{ mode === "login" ? "Welcome back" : "Get started with Prospectus" }}
-        </h1>
-        <p class="mt-1.5 text-center text-sm text-muted-foreground">
-          {{ mode === "login" ? "Sign in to your lead generation workspace" : "One workspace for sourcing, qualifying, and exporting leads" }}
-        </p>
+        <h1 class="text-center text-xl font-bold tracking-tight">Welcome back</h1>
+        <p class="mt-1.5 text-center text-sm text-muted-foreground">Sign in to your lead generation workspace</p>
 
-        <form class="mt-8 space-y-3" :aria-label="mode === 'login' ? 'Sign in form' : 'Registration form'" @submit.prevent="submit">
-          <div v-if="mode === 'register'" class="space-y-1.5">
-            <Label for="name">Name</Label>
-            <Input id="name" v-model="name" required autocomplete="name" placeholder="Your Name" />
-          </div>
+        <form class="mt-8 space-y-3" aria-label="Sign in form">
           <div class="space-y-1.5">
             <Label for="email">Email</Label>
             <Input id="email" v-model="email" type="email" required autocomplete="email" placeholder="you@example.com" />
           </div>
           <div class="space-y-1.5">
             <Label for="password">Password</Label>
-            <Input
-              id="password"
-              v-model="password"
-              type="password"
-              required
-              :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
-              placeholder="••••••••"
-            />
+            <Input id="password" v-model="password" type="password" required autocomplete="current-password" placeholder="••••••••" />
           </div>
 
           <p v-if="error" class="text-sm text-destructive" role="alert">{{ error }}</p>
 
           <Button type="submit" :disabled="pending" class="w-full">
-            {{ pending ? "Working…" : mode === "login" ? "Continue" : "Create account" }}
+            {{ pending ? "Signing in…" : "Continue" }}
             <ArrowRight v-if="!pending" class="size-4" aria-hidden="true" />
           </Button>
         </form>
-
-        <div class="mt-5 flex items-center gap-3" role="separator" aria-label="or">
-          <span class="h-px flex-1 border-t border-dashed border-border" />
-          <span class="text-[11px] font-medium uppercase tracking-widest text-muted-foreground">or</span>
-          <span class="h-px flex-1 border-t border-dashed border-border" />
-        </div>
-
-        <p class="mt-5 text-center text-sm text-muted-foreground">
-          <template v-if="mode === 'login'">
-            New here?
-            <button type="button" class="font-semibold text-foreground underline underline-offset-4" @click="mode = 'register'">Create an account</button>
-          </template>
-          <template v-else>
-            Already have an account?
-            <button type="button" class="font-semibold text-foreground underline underline-offset-4" @click="mode = 'login'">Sign in</button>
-          </template>
-        </p>
-
-        <p class="mt-3 text-center text-xs text-muted-foreground">
-          Just exploring?
-          <button type="button" class="underline underline-offset-4 hover:text-foreground" @click="fillExample">Fill example data</button>
-        </p>
       </div>
 
       <p class="text-center text-xs text-muted-foreground">Internal tool · credentials are encrypted at rest</p>

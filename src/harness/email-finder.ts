@@ -1,4 +1,4 @@
-import { resolveMx } from "node:dns/promises";
+import { hasMailExchange } from "@src/harness/dns-cache";
 
 export interface FoundEmail {
   email: string;
@@ -86,15 +86,6 @@ export function patternCandidatesFor(name: string, domain: string): string[] {
   return candidates;
 }
 
-async function domainHasMx(domain: string): Promise<boolean> {
-  try {
-    const records = await resolveMx(domain);
-    return records.length > 0;
-  } catch {
-    return false;
-  }
-}
-
 export async function findEmails(input: { siteContent: string | null; website: string | null; contactName?: string | null }): Promise<FoundEmail[]> {
   const found = new Map<string, FoundEmail>();
 
@@ -121,7 +112,7 @@ export async function findEmails(input: { siteContent: string | null; website: s
   const domain = domainOf(input.website);
   const contactName = input.contactName?.trim() || null;
   if (domain && contactName) {
-    const hasMx = await domainHasMx(domain);
+    const hasMx = await hasMailExchange(domain);
     if (hasMx) {
       for (const email of patternCandidatesFor(contactName, domain)) {
         if (isJunk(email) || found.has(email)) continue;
